@@ -1,30 +1,44 @@
 /dts-v1/;
 /plugin/;
-
 / {
-	compatible = "brcm,bcm2835";
+  compatible = "brcm,bcm2835";
 
-	fragment@0 {
-		target = <&spidev0>;
+  fragment@0 {
+      target = <&spidev0>;
+      __overlay__ {
+           status = "disabled";
+           };
+        };
 
-		__overlay__ {
-			status = "disabled";
-		};
-	};
+  fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            adc_vref: fixedregulator@0 {
+                compatible = "regulator-fixed";
+                regulator-name = "fixed-supply";
+                regulator-min-microvolt = <5000000>;
+                regulator-max-microvolt = <5000000>;
+                regulator-boot-on;
+            };
+        };
+  };
 
-	fragment@1 {
-		target = <&spi0>;
-
-		__overlay__{
-			#address-cells = <1>;
-			#size-cells = <0>;
-			status = "okay";
-
-			ltc2376@0{
-				compatible = "adi,ltc2376";
-				reg = <0>;
-				spi-max-frequency = <16000000>;
-			};
-		};
-	};
+  fragment@2{
+      target = <&spi0>;
+       __overlay__{
+           #address-cells = <1>;
+           #size-cells = <0>;
+           status = "okay";
+           adc@0{
+                 compatible = "adi,ltc2376";
+                 reg = <0>;
+                 spi-max-frequency = <16000000>;
+                 pwms = <&pwm 0 100000000>;
+                 interrupt-parent = <&gpio>;
+                 interrupts = <13 IRQ_TYPE_EDGE_FALLING>;
+                 spi-cpha;
+                 vref-supply = <&adc_vref>;
+                };
+           };
+      };
 };

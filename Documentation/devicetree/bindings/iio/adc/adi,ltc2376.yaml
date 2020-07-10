@@ -40,11 +40,13 @@ examples:
         #address-cells = <0x01>;
         #size-cells = <0x00>;
 
-        ltc2376@0{
+        adc@0{
                 compatible = "adi,ltc2376";
                 vref-supply = <&vref>;
                 reg = <0>;
                 spi-max-frequency = <16000000>;
+                pwms = <&pwm 0 100000000>;
+                spi-cpha;
         };
     };
 ...
