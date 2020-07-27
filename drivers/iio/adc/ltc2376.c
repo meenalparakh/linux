@@ -13,15 +13,21 @@
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 #include <linux/sysfs.h>
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
 
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
 
-#include <linux/gpio.h>
-#include <linux/interrupt.h>
 
 #define DEFAULT_SAMPLING_FREQUENCY 125000
+#define DEFAULT_DUTY_CYCLE 30
 #define MINIMUM_PERIOD 108
+#define MAX_WAIT_TIME 5
 
 struct ltc2376_state {
     struct spi_device *spi;
@@ -78,8 +84,7 @@ ssize_t ltc2376_store_freq (struct device *dev,
         mutex_unlock(&st->lock);
         return 0;
     }
-    ret = pwm_config(st->pwm, DIV_ROUND_CLOSEST(period, 2), period);
-
+    ret = pwm_config(st->pwm, DEFAULT_DUTY_CYCLE, period);
 
     if (ret < 0){
         printk(KERN_ALERT "ltc2376: pwm_config failed! Aborting write\n");
@@ -147,8 +152,11 @@ static int ltc2376_read_raw(struct iio_dev *indio_dev,
     int ret;
     u16 temp;
     struct ltc2376_state *st = iio_priv(indio_dev);
+
     switch (m) {
         case IIO_CHAN_INFO_RAW:
+            if (iio_buffer_enabled(indio_dev))
+                return -EBUSY;
             ret = ltc2376_conversion(indio_dev, &temp);
             if (ret < 0)
                     return ret;
@@ -189,22 +197,38 @@ static const struct iio_chan_spec ltc2376_channels[] = {
 };
 
 /*
-static irqreturn_t intr_handler(int irq, void *private)
+static irqreturn_t ltc2376_intr_handler(int irq, void *p)
 {
-//    struct iio_dev *indio_dev = private;
-//    struct ltc2376_state *st = iio_priv(indio_dev);
+    struct iio_poll_func *pf = p;
+    struct iio_dev *indio_dev = pf->indio_dev;
+    struct ltc2376_state *st = iio_priv(indio_dev);
+    int ret;
+    u16 val;
+    printk(KERN_ALERT "ltc2376: entered interrupt \n");
+//    ndelay(MAX_WAIT_TIME);
+    ret = ltc2376_conversion(indio_dev, &val);
+    if (ret)
+        goto done;
 
-    printk(KERN_ALERT "entered interrupt \n");
+    iio_push_to_buffers_with_timestamp(indio_dev, st->data.rx,
+        iio_get_time_ns(indio_dev));
+
+done:
+    iio_trigger_notify_done(indio_dev->trig);
+
     return IRQ_HANDLED;
 }
 */
+
 static int ltc2376_probe(struct spi_device *spi)
 {
     struct ltc2376_state *st;
     struct iio_dev *indio_dev;
-    int ret, period, duty;
+    int ret;
+    unsigned int period;
+    struct pwm_state state = {};
 
-    printk(KERN_ALERT "ltc2376 check \n");
+    printk(KERN_ALERT "ltc2376 check\n");
 
     indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
     if (!indio_dev)
@@ -213,23 +237,30 @@ static int ltc2376_probe(struct spi_device *spi)
     st = iio_priv(indio_dev);
     st->spi = spi;
     spi->mode = SPI_CPHA;
+    spi_set_drvdata(spi, indio_dev);
 
     st->frequency = DEFAULT_SAMPLING_FREQUENCY;
     period = DIV_ROUND_CLOSEST(NSEC_PER_SEC, st->frequency);
-    duty = DIV_ROUND_CLOSEST(period, 2);
 
     st->pwm = devm_pwm_get(&spi->dev, NULL);
-
     if (IS_ERR(st->pwm)) {
-            int res = PTR_ERR(st->pwm);
-            pr_err("pwm_get failed: %d\n", res);
-            return res;
+        ret = PTR_ERR(st->pwm);
+        if (ret != -EPROBE_DEFER)
+            pr_err("pwm_get failed: %d\n", ret);
+        return ret;
     }
 
-    pwm_config(st->pwm, duty, period);
-    pwm_enable(st->pwm);
+    pwm_init_state(st->pwm, &state);
+    state.period = period;
+    state.duty_cycle = DEFAULT_DUTY_CYCLE;
+    state.enabled = true;
+    ret = pwm_apply_state(st->pwm, &state);
+    if (ret) {
+        pr_err("Failed to configure PWM: %d\n", ret);
+        return ret;
+    }
 
-//    ret = devm_request_irq(&spi->dev, spi->irq, intr_handler,
+//    ret = devm_request_irq(&spi->dev, spi->irq, ltc2376_intr_handler,
 //                   IRQF_TRIGGER_FALLING, dev_name(&spi->dev), indio_dev);
 //    if (ret < 0) {
 //        dev_err(&spi->dev, "failed requesting irq %d\n", spi->irq);
@@ -253,8 +284,23 @@ static int ltc2376_probe(struct spi_device *spi)
     st->num_bits = indio_dev->channels->scan_type.realbits;
 
     mutex_init(&st->lock);
-    
+
+//    ret = iio_triggered_buffer_setup(indio_dev, NULL,
+//            NULL, NULL);
+//    if (ret)
+//        dev_err(&spi->dev, "buffer setup failed \n");
+//
+    printk(KERN_ALERT "exiting\n");
     return devm_iio_device_register(&spi->dev, indio_dev);
+}
+
+static int ltc2376_remove(struct spi_device *spi)
+{
+   struct iio_dev *indio_dev = spi_get_drvdata(spi);
+   struct ltc2376_state *st = iio_priv(indio_dev);
+
+    pwm_disable(st->pwm);
+    return 0;
 }
 
 static const struct of_device_id ltc2376_of_match[] = {
@@ -270,6 +316,7 @@ static struct spi_driver ltc2376_driver = {
         .of_match_table = ltc2376_of_match,
     },
     .probe = ltc2376_probe,
+    .remove = ltc2376_remove
 };
 module_spi_driver(ltc2376_driver);
 
