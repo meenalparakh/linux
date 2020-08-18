@@ -41,12 +41,15 @@ examples:
         #size-cells = <0x00>;
 
         adc@0{
-                compatible = "adi,ltc2376";
-                vref-supply = <&vref>;
-                reg = <0>;
-                spi-max-frequency = <16000000>;
-                pwms = <&pwm 0 100000000>;
-                spi-cpha;
-        };
+              compatible = "adi,ltc2376";
+              reg = <0>;
+              spi-max-frequency = <16000000>;
+              pwms = <&pwm 0 10000000>;
+              vref-supply = <&adc_vref>;
+              spi-cpha;
+              spi-cpol;
+              interrupt-parent = <&gpio>;
+              interrupts = <25 0x2>;
+             };
     };
 ...
