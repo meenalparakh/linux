@@ -7,15 +7,14 @@
 
 #include <asm/unaligned.h>
 #include <linux/device.h>
+#include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pwm.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 #include <linux/sysfs.h>
-#include <linux/gpio.h>
-#include <linux/interrupt.h>
-#include <linux/delay.h>
+#include <linux/util_macros.h>
 
 #include <linux/iio/iio.h>
 #include <linux/iio/buffer.h>
@@ -30,37 +29,35 @@
 #define MAX_WAIT_TIME 5
 
 struct ltc2376_state {
-    struct spi_device *spi;
-    struct regulator *reg;
-    struct pwm_device *pwm;
+    struct spi_device       *spi;
+    struct regulator        *reg;
+    struct pwm_device       *pwm;
 
-    struct iio_trigger *trig;
-    struct irq_chip irq;
+    struct iio_trigger      *trig;
+    struct irq_chip         irq;
 
-    struct spi_transfer        xfer;
-    struct spi_message        msg;
+    struct spi_transfer     xfer;
+    struct spi_message      msg;
 
-    struct mutex lock;
-    unsigned int num_bits;
+    struct mutex            lock;
+    unsigned int            num_bits;
 
-    unsigned int frequency;
+    unsigned int            frequency;
 
     /*
      * DMA (thus cache coherency maintenance) requires the
      * transfer buffers to live in their own cache lines.
-     * Make the buffer large enough for one 16 bit sample and one 64 bit
+     * Make the buffer large enough for two 16 bit sample and one 64 bit
      * aligned 64 bit timestamp.
      */
-
     struct {
-        __be32 sample;
+        __be16 sample[2];
         s64 timestamp;
     } data ____cacheline_aligned;
 };
 
 enum ltc2376_ids {
-    ID_LTC2376,
-    ID_LTC2379
+    ID_LTC2376
  };
 
 ssize_t ltc2376_show_freq (struct device *dev,
@@ -101,16 +98,16 @@ ssize_t ltc2376_store_freq (struct device *dev,
     }
     ret = pwm_config(st->pwm, DEFAULT_DUTY_CYCLE, period);
 
-    if (ret < 0){
+    if (ret < 0)
         printk(KERN_ALERT "ltc2376: pwm_config failed! Aborting write\n");
-    }
+
     st->frequency = freq;
     mutex_unlock(&st->lock);
 
     return count;
 }
 
-static IIO_DEV_ATTR_SAMP_FREQ (S_IWUSR | S_IRUGO, ltc2376_show_freq, ltc2376_store_freq);
+static IIO_DEV_ATTR_SAMP_FREQ(S_IWUSR | S_IRUGO, ltc2376_show_freq, ltc2376_store_freq);
 
 static struct attribute *ltc2376_attributes[] = {
     &iio_dev_attr_sampling_frequency.dev_attr.attr,
@@ -126,7 +123,6 @@ static int ltc2376_read_raw(struct iio_dev *indio_dev,
                int *val, int *val2, long m)
 {
     int ret;
-    __be32 temp;
     struct ltc2376_state *st = iio_priv(indio_dev);
 
     switch (m) {
@@ -141,8 +137,7 @@ static int ltc2376_read_raw(struct iio_dev *indio_dev,
             iio_device_release_direct_mode(indio_dev);
             if (ret < 0)
                 return ret;
-            temp = be32_to_cpu(st->data.sample) >> (32-st->num_bits);
-            *val =  temp ^ (1 << (st->num_bits-1));
+            *val = sign_extend32(be16_to_cpu(st->data.sample[0]), st->num_bits-1);
             return IIO_VAL_INT;
 
         case IIO_CHAN_INFO_SCALE:
@@ -156,9 +151,9 @@ static int ltc2376_read_raw(struct iio_dev *indio_dev,
             return IIO_VAL_FRACTIONAL_LOG2;
 
         case IIO_CHAN_INFO_OFFSET:
-            *val = 0;
+            *val = (1 << (st->num_bits - 1));
             if (chan->differential)
-                *val = - (1 << (st->num_bits - 1));
+                *val = 0;
             return IIO_VAL_INT;
 
         default:
@@ -171,49 +166,43 @@ static const struct iio_info ltc2376_info = {
     .read_raw = &ltc2376_read_raw,
 };
 
-#define LTC2376_SINGLE_CHANNEL(real_bits, storage_bits)  \
-{                                   \
-    .type = IIO_VOLTAGE,            \
-    .indexed = 1,                   \
-    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
-    .info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE), \
-    .scan_index = 0,                \
-    .scan_type = {                  \
-            .sign = 's',            \
-            .endianness = IIO_BE,    \
-            .realbits = real_bits,   \
-            .shift = 0,      \
-            .storagebits = storage_bits,      \
-    },                              \
-}                                   \
-
-
-#define LTC2376_DIFF_CHANNEL(real_bits)  \
-{                                   \
-    .type = IIO_VOLTAGE,            \
-    .indexed = 1,                   \
-    .differential = 1,              \
-    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
+#define LTC2376_SINGLE_CHANNEL(real_bits)                \
+{                                                        \
+    .type = IIO_VOLTAGE,                                 \
+    .indexed = 1,                                        \
+    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW),        \
     .info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) \
-        | BIT(IIO_CHAN_INFO_OFFSET),           \
-    .scan_index = 1 ,         \
-    .scan_type = {                  \
-            .sign = 's',            \
-            .endianness = IIO_BE,    \
-            .realbits = real_bits,   \
-            .shift = 0,      \
-            .storagebits = storage_bits,      \
-    },                              \
+        | BIT(IIO_CHAN_INFO_OFFSET),                     \
+    .scan_index = 0,                                     \
+    .scan_type = {                                       \
+            .sign = 's',                                 \
+            .endianness = IIO_BE,                        \
+            .realbits = real_bits,                       \
+            .shift = 0,                                  \
+            .storagebits = 16,                           \
+    },                                                   \
+}                                                        \
+
+#define LTC2376_DIFF_CHANNEL(real_bits)                  \
+{                                                        \
+    .type = IIO_VOLTAGE,                                 \
+    .indexed = 1,                                        \
+    .differential = 1,                                   \
+    .info_mask_separate = BIT(IIO_CHAN_INFO_RAW),        \
+    .info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE) \
+        | BIT(IIO_CHAN_INFO_OFFSET),                     \
+    .scan_type = {                                       \
+            .sign = 's',                                 \
+            .endianness = IIO_BE,                        \
+            .realbits = real_bits,                       \
+            .shift = 0,                                  \
+            .storagebits = 16,                           \
+    },                                                   \
 }
 
 static const struct iio_chan_spec ltc2376_channels[] = {
-    LTC2376_SINGLE_CHANNEL(16, 16),
-    LTC2376_DIFF_CHANNEL(16, 16)
-};
-
-static const struct iio_chan_spec ltc2379_channels[] = {
-    LTC2376_SINGLE_CHANNEL(18, 18),
-    LTC2376_DIFF_CHANNEL(18, 18)
+    LTC2376_SINGLE_CHANNEL(16),
+    LTC2376_DIFF_CHANNEL(16)
 };
 
 static irqreturn_t ltc2376_trigger_handler(int irq, void *p)
@@ -222,15 +211,12 @@ static irqreturn_t ltc2376_trigger_handler(int irq, void *p)
     struct iio_dev *indio_dev = pf->indio_dev;
     struct ltc2376_state *st = iio_priv(indio_dev);
     int b_sent;
-    __be32 temp;
 
     mutex_lock(&st->lock);
+
     b_sent = spi_sync(st->spi, &st->msg);
     if (b_sent < 0)
         goto done;
-
-    temp = be32_to_cpu(st->data.sample) >> (32-st->num_bits);
-    st->data.sample =  temp ^ (1 << (st->num_bits-1));
 
     iio_push_to_buffers_with_timestamp(indio_dev, &st->data,
         iio_get_time_ns(indio_dev));
@@ -249,21 +235,17 @@ static int ltc2376_probe(struct spi_device *spi)
 {
     struct ltc2376_state *st;
     struct iio_dev *indio_dev;
-    int ret, dev_id;
+    int ret;
     unsigned int period;
     struct pwm_state state = {};
 
-    printk(KERN_ALERT "ltc2376 probe with interrupt check 7 %i \n", spi->irq);
+    printk(KERN_ALERT "ltc2376 probe with interrupt %i \n", spi->irq);
 
     indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
     if (!indio_dev)
         return -ENOMEM;
 
     st = iio_priv(indio_dev);
-
-    dev_id = spi_get_device_id(spi)->driver_data;
-
-    spi->max_speed_hz = 500000;
     st->spi = spi;
     spi->mode = SPI_MODE_3;
     spi_set_drvdata(spi, indio_dev);
@@ -296,20 +278,13 @@ static int ltc2376_probe(struct spi_device *spi)
     ret = regulator_enable(st->reg);
     if (ret < 0)
         return ret;
+
     indio_dev->dev.parent = &spi->dev;
     indio_dev->name = "ltc2376";
     indio_dev->modes = INDIO_DIRECT_MODE;
-
-    if (dev_id == ID_LTC2376)
-        indio_dev->channels = ltc2376_channels;
-    else if (dev_id == ID_LTC2379)
-        indio_dev->channels = ltc2379_channels;
-    else
-        pr_err ("Device ID did not match \n");
-
+    indio_dev->channels = ltc2376_channels;
     indio_dev->num_channels = ARRAY_SIZE(ltc2376_channels);
     indio_dev->info = &ltc2376_info;
-
 
     st->trig = devm_iio_trigger_alloc(&spi->dev, "%s-dev%d", indio_dev->name,
                      indio_dev->id);
@@ -327,7 +302,7 @@ static int ltc2376_probe(struct spi_device *spi)
 
     ret = devm_request_irq(&spi->dev, spi->irq,
                       &iio_trigger_generic_data_rdy_poll,
-                   IRQF_TRIGGER_FALLING | IRQF_ONESHOT, "ltc2376_data_rdy", st->trig);
+                   IRQF_TRIGGER_FALLING | IRQF_ONESHOT, "ltc2376irq", st->trig);
 
     if (ret < 0) {
         dev_err(&spi->dev, "failed requesting irq %d\n", spi->irq);
@@ -343,10 +318,8 @@ static int ltc2376_probe(struct spi_device *spi)
 
     st->num_bits = indio_dev->channels->scan_type.realbits;
     mutex_init(&st->lock);
-
     st->xfer.rx_buf = &st->data;
-    st->xfer.len = 4;
-
+    st->xfer.len = 2;
     spi_message_init(&st->msg);
     spi_message_add_tail(&st->xfer, &st->msg);
 
@@ -366,7 +339,6 @@ static int ltc2376_remove(struct spi_device *spi)
 
 static const struct spi_device_id ltc2376_id[] = {
     {"ltc2376", ID_LTC2376},
-    {"ltc2379", ID_LTC2379},
     {}
 };
 
